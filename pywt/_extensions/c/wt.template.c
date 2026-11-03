@@ -120,6 +120,30 @@ static inline void CAT(TYPE, _downcoef_row)(const TYPE * const restrict input_ro
     }
 }
 
+/* One contiguous line of a dwt (symmetric mode, n_in >= F), vectorized along the line: the line is copied into ext
+ * with F - 1 symmetric extension values on both sides, then out[o] += f[j] x[2 o + 1 - j] with the tap j outside
+ * (stride-2 loads); per output the same summation order as downsampling_convolution. */
+static inline void CAT(TYPE, _downcoef_line_sym)(const TYPE * const restrict input, const size_t n_in,
+                                                 const REAL_TYPE * const restrict filter, const size_t F,
+                                                 TYPE * const restrict output, const size_t n_out,
+                                                 TYPE * const restrict ext){
+    const size_t pad = F - 1;
+    size_t k, o, j;
+    memcpy(ext + pad, input, n_in * sizeof(TYPE));
+    for (k = 0; k < pad; ++k){
+        ext[pad - 1 - k] = input[k];                        // x[-1 - k] = x[k]
+        ext[pad + n_in + k] = input[n_in - 1 - k];          // x[n + k] = x[n - 1 - k]
+    }
+    for (o = 0; o < n_out; ++o)
+        output[o] = 0;
+    for (j = 0; j < F; ++j){
+        const REAL_TYPE f = filter[j];
+        const TYPE * const e = ext + pad + 1 - j;           // e[2 o] = x[2 o + 1 - j]
+        for (o = 0; o < n_out; ++o)
+            output[o] += f * e[2 * o];
+    }
+}
+
 /* Decomposition of input with lowpass filter */
 
 int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo input_info,
@@ -239,11 +263,31 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
         return 0;
     }
 
+    // Vectorized contiguous line: dwt, symmetric mode, axis contiguous in input and output
+    const size_t F = wavelet->dec_len;
+    TYPE * const ext = (transform == DWT_TRANSFORM && dwt_mode == MODE_SYMMETRIC && input_info.shape[axis] >= F
+                        && !make_temp_input && !make_temp_output)
+                       ? malloc((input_info.shape[axis] + 2 * (F - 1)) * sizeof(TYPE)) : NULL;
+    const REAL_TYPE * const filter = coef == COEF_APPROX ? wavelet->CAT(dec_lo_, REAL_TYPE)
+                                                         : wavelet->CAT(dec_hi_, REAL_TYPE);
+
     for (i = 0; i < num_loops; ++i){
         pywt_index_t j, input_offset, output_offset, unused;
         const TYPE * input_row;
         TYPE * output_row;
         if (timing) t0 = pywt_now();
+        if (ext){
+            CAT(TYPE, _line_offsets)(i, &input_info, NULL, &output_info, axis, &input_offset, &unused, &output_offset);
+            if (timing) t1 = pywt_now();
+            CAT(TYPE, _downcoef_line_sym)((const TYPE *)((const char *) input + input_offset), input_info.shape[axis],
+                                          filter, F, (TYPE *)((char *) output + output_offset),
+                                          output_info.shape[axis], ext);
+            if (timing){
+                pywt_t[T_DEC][T_IN] += t1 - t0;
+                pywt_t[T_DEC][T_KERNEL] += pywt_now() - t1;
+            }
+            continue;
+        }
 
         // Calculate offset into linear buffer
         CAT(TYPE, _line_offsets)(i, &input_info, NULL, &output_info, axis, &input_offset, &unused, &output_offset);
@@ -279,6 +323,7 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
         }
     }
 
+    free(ext);
     free(temp_input);
     free(temp_output);
     return 0;
