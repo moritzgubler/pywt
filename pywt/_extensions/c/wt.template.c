@@ -290,6 +290,56 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
 }
 
 
+/* Reconstruction of g neighbouring lines at once, read and written directly in the strided arrays (g consecutive
+ * values per axis position): as upsampling_convolution_valid_sf, outputs o, o + 1 of input position i are
+ * sum_j rec[2 j] x[i - j] and sum_j rec[2 j + 1] x[i - j]; output = a part + d part (same order as the original).
+ * Sub-blocks of W lines: the 4 accumulators (a / d, even / odd) stay in registers; inner loops over the lines. */
+#define PYWT_IDWT_W 16
+static inline __attribute__((always_inline))
+void CAT(TYPE, _idwt_lines_w)(const char * const a, const pywt_index_t stride_a,
+                              const char * const d, const pywt_index_t stride_d, const size_t n, const size_t w,
+                              const REAL_TYPE * const restrict lo, const REAL_TYPE * const restrict hi, const size_t H,
+                              char * const output, const pywt_index_t stride_out){
+    size_t i, j, b, o;
+    for (o = 0, i = H - 1; i < n; ++i, o += 2){
+        TYPE ae[PYWT_IDWT_W], ao[PYWT_IDWT_W], de[PYWT_IDWT_W], dd[PYWT_IDWT_W];
+        for (b = 0; b < w; ++b)
+            ae[b] = ao[b] = de[b] = dd[b] = 0;
+        for (j = 0; j < H; ++j){
+            const TYPE * const ra = (const TYPE *)(a + (i - j) * stride_a);
+            const TYPE * const rd = (const TYPE *)(d + (i - j) * stride_d);
+            const REAL_TYPE le = lo[2 * j], lo_ = lo[2 * j + 1], he = hi[2 * j], ho = hi[2 * j + 1];
+            for (b = 0; b < w; ++b){
+                ae[b] += le * ra[b];
+                ao[b] += lo_ * ra[b];
+                de[b] += he * rd[b];
+                dd[b] += ho * rd[b];
+            }
+        }
+        TYPE * const e_out = (TYPE *)(output + o * stride_out), * const o_out = (TYPE *)(output + (o + 1) * stride_out);
+        for (b = 0; b < w; ++b){
+            e_out[b] = ae[b] + de[b];
+            o_out[b] = ao[b] + dd[b];
+        }
+    }
+}
+
+/* g lines (a and d both present): full sub-blocks with the constant width, remainder generic */
+static inline void CAT(TYPE, _idwt_lines)(const char * const a, const pywt_index_t stride_a,
+                                          const char * const d, const pywt_index_t stride_d, const size_t n,
+                                          const size_t g, const DiscreteWavelet * const restrict wavelet,
+                                          char * const output, const pywt_index_t stride_out){
+    const REAL_TYPE * const lo = wavelet->CAT(rec_lo_, REAL_TYPE), * const hi = wavelet->CAT(rec_hi_, REAL_TYPE);
+    const size_t H = wavelet->rec_len / 2, s = sizeof(TYPE);
+    size_t h;
+    for (h = 0; h + PYWT_IDWT_W <= g; h += PYWT_IDWT_W)
+        CAT(TYPE, _idwt_lines_w)(a + h * s, stride_a, d + h * s, stride_d, n, PYWT_IDWT_W, lo, hi, H,
+                                 output + h * s, stride_out);
+    if (h < g)
+        CAT(TYPE, _idwt_lines_w)(a + h * s, stride_a, d + h * s, stride_d, n, g - h, lo, hi, H,
+                                 output + h * s, stride_out);
+}
+
 /* One line of a reconstruction: output = rec_lo * a + rec_hi * d (upsampled); a_row or d_row may be NULL */
 static inline void CAT(TYPE, _idwt_row)(const TYPE * const restrict a_row, const TYPE * const restrict d_row,
                                         const size_t n, const DiscreteWavelet * const restrict wavelet,
@@ -384,6 +434,10 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
             free(ba); free(bd); free(bout);
             goto cleanup;
         }
+        // multi-line kernel, no copies: as upsampling_convolution_valid_sf (not periodization, even filter, a and d)
+        const size_t F = wavelet->rec_len;
+        const int lines = have_a && have_d && mode != MODE_PERIODIZATION && F % 2 == 0 && n >= F / 2
+                          && n_out == 2 * n - F + 2;
         for (i = 0; i < num_loops; ){
             size_t j, b, g = n_last - i % n_last;          // lines i .. i + g - 1: neighbours along the last axis
             pywt_index_t a_offset, d_offset, output_offset;
@@ -391,6 +445,28 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
             if (timing) t0 = pywt_now();
             CAT(TYPE, _line_offsets)(i, have_a ? a_info : NULL, have_d ? d_info : NULL, &output_info, axis,
                                      &a_offset, &d_offset, &output_offset);
+            if (lines){
+                // rows into the line-interleaved buffers first: a separate copy loop keeps many loads in flight
+                for (j = 0; j < n; ++j){
+                    memcpy(ba + j * PYWT_BLOCK, (const char *) coefs_a + a_offset + j * a_info->strides[axis], g * sizeof(TYPE));
+                    memcpy(bd + j * PYWT_BLOCK, (const char *) coefs_d + d_offset + j * d_info->strides[axis], g * sizeof(TYPE));
+                }
+                if (timing) t1 = pywt_now();
+                CAT(TYPE, _idwt_lines)((const char *) ba, PYWT_BLOCK * sizeof(TYPE), (const char *) bd,
+                                       PYWT_BLOCK * sizeof(TYPE), n, g, wavelet, (char *) bout, PYWT_BLOCK * sizeof(TYPE));
+                if (timing) t2 = pywt_now();
+                // and out of the buffer in a separate loop
+                for (j = 0; j < n_out; ++j)
+                    memcpy((char *) output + output_offset + j * output_info.strides[axis], bout + j * PYWT_BLOCK,
+                           g * sizeof(TYPE));
+                if (timing){
+                    pywt_t[T_REC][T_IN] += t1 - t0;
+                    pywt_t[T_REC][T_KERNEL] += t2 - t1;
+                    pywt_t[T_REC][T_OUT] += pywt_now() - t2;
+                }
+                i += g;
+                continue;
+            }
             for (j = 0; j < n; ++j){
                 if (have_a){
                     const TYPE * src = (const TYPE *)((const char *) coefs_a + a_offset + j * a_info->strides[axis]);
