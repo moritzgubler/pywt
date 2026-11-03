@@ -84,8 +84,10 @@ def test_stride():
             strided = np.ones((3, 12), dtype=data.dtype)
             strided[::-1, ::2] = data
             strided_dwtn = pywt.dwtn(strided[::-1, ::2], wavelet)
+            # strided and contiguous paths may round differently: absolute tolerance at the rounding scale of the data
+            atol = 10 * np.finfo(dtype).eps * np.abs(data).max()
             for key in expected:
-                assert_allclose(strided_dwtn[key], expected[key])
+                assert_allclose(strided_dwtn[key], expected[key], atol=atol)
 
 
 def test_byte_offset():
@@ -103,8 +105,10 @@ def test_byte_offset():
                                                     align=True))
             padded[:] = data
             padded_dwtn = pywt.dwtn(padded['data'], wavelet)
+            # strided and contiguous paths may round differently: absolute tolerance at the rounding scale of the data
+            atol = 10 * np.finfo(dtype).eps * np.abs(data).max()
             for key in expected:
-                assert_allclose(padded_dwtn[key], expected[key])
+                assert_allclose(padded_dwtn[key], expected[key], atol=atol)
 
 
 def test_3D_reconstruct_complex():

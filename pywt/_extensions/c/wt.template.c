@@ -385,6 +385,35 @@ static inline void CAT(TYPE, _idwt_lines)(const char * const a, const pywt_index
                                  output + h * s, stride_out);
 }
 
+/* One contiguous line of an idwt (a and d present), vectorized along the line: for output pair k (input position
+ * i = H - 1 + k) the four sums a / d even / odd are accumulated over the taps with the tap j outside (contiguous
+ * loads) in tmp (4 m values, m = n - H + 1), then out[2 k] = a_e + d_e, out[2 k + 1] = a_o + d_o. */
+static inline void CAT(TYPE, _idwt_line)(const TYPE * const restrict a, const TYPE * const restrict d, const size_t n,
+                                         const DiscreteWavelet * const restrict wavelet,
+                                         TYPE * const restrict output, TYPE * const restrict tmp){
+    const REAL_TYPE * const lo = wavelet->CAT(rec_lo_, REAL_TYPE), * const hi = wavelet->CAT(rec_hi_, REAL_TYPE);
+    const size_t H = wavelet->rec_len / 2, m = n - H + 1;
+    TYPE * const restrict ae = tmp, * const restrict ao = tmp + m, * const restrict de = tmp + 2 * m,
+         * const restrict dd = tmp + 3 * m;
+    size_t j, k;
+    for (k = 0; k < m; ++k)
+        ae[k] = ao[k] = de[k] = dd[k] = 0;
+    for (j = 0; j < H; ++j){
+        const REAL_TYPE le = lo[2 * j], lo_ = lo[2 * j + 1], he = hi[2 * j], ho = hi[2 * j + 1];
+        const TYPE * const ra = a + H - 1 - j, * const rd = d + H - 1 - j;    // ra[k] = a[i - j]
+        for (k = 0; k < m; ++k){
+            ae[k] += le * ra[k];
+            ao[k] += lo_ * ra[k];
+            de[k] += he * rd[k];
+            dd[k] += ho * rd[k];
+        }
+    }
+    for (k = 0; k < m; ++k){
+        output[2 * k] = ae[k] + de[k];
+        output[2 * k + 1] = ao[k] + dd[k];
+    }
+}
+
 /* One line of a reconstruction: output = rec_lo * a + rec_hi * d (upsampled); a_row or d_row may be NULL */
 static inline void CAT(TYPE, _idwt_row)(const TYPE * const restrict a_row, const TYPE * const restrict d_row,
                                         const size_t n, const DiscreteWavelet * const restrict wavelet,
@@ -546,10 +575,29 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
         return 0;
     }
 
+    // Vectorized contiguous line: a and d present and contiguous, output contiguous, as the multi-line kernel
+    const size_t n_in = have_a ? a_info->shape[axis] : d_info->shape[axis], F = wavelet->rec_len;
+    const size_t n_out = output_info.shape[axis];
+    TYPE * const tmp = (have_a && have_d && !make_temp_coefs_a && !make_temp_coefs_d && !make_temp_output
+                        && mode != MODE_PERIODIZATION && F % 2 == 0 && n_in >= F / 2 && n_out == 2 * n_in - F + 2)
+                       ? malloc(4 * (n_in - F / 2 + 1) * sizeof(TYPE)) : NULL;
+
     for (i = 0; i < num_loops; ++i){
         pywt_index_t j, axis_idx, a_offset = 0, d_offset = 0, output_offset = 0;
         TYPE * output_row;
         if (timing) t0 = pywt_now();
+        if (tmp){
+            CAT(TYPE, _line_offsets)(i, a_info, d_info, &output_info, axis, &a_offset, &d_offset, &output_offset);
+            if (timing) t1 = pywt_now();
+            CAT(TYPE, _idwt_line)((const TYPE *)((const char *) coefs_a + a_offset),
+                                  (const TYPE *)((const char *) coefs_d + d_offset), n_in, wavelet,
+                                  (TYPE *)((char *) output + output_offset), tmp);
+            if (timing){
+                pywt_t[T_REC][T_IN] += t1 - t0;
+                pywt_t[T_REC][T_KERNEL] += pywt_now() - t1;
+            }
+            continue;
+        }
 
         // Calculate offset into linear buffer
         {
@@ -624,6 +672,7 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
         }
     }
 
+    free(tmp);
     free(temp_coefs_a);
     free(temp_coefs_d);
     free(temp_output);
