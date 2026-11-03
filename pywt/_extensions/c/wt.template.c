@@ -47,6 +47,57 @@ static inline void CAT(TYPE, _line_offsets)(size_t i, const ArrayInfo * const a,
     }
 }
 
+/* g neighbouring lines (g consecutive values per axis position, axis stride `stride` bytes) copied into ext,
+ * line-interleaved with row stride PYWT_BLOCK, plus `pad` half-sample symmetric extension rows on both sides:
+ * row m = input index m - pad. Needs pad <= n (one reflection). */
+static inline void CAT(TYPE, _sym_rows)(const char * const input, const pywt_index_t stride, const size_t n,
+                                        const size_t g, const size_t pad, TYPE * const restrict ext){
+    size_t m;
+    for (m = 0; m < n + 2 * pad; ++m){
+        pywt_index_t k = (pywt_index_t) m - (pywt_index_t) pad;
+        if (k < 0)
+            k = -k - 1;                                     // x[-1] = x[0], x[-2] = x[1], ...
+        else if (k >= (pywt_index_t) n)
+            k = 2 * (pywt_index_t) n - 1 - k;               // x[n] = x[n-1], ...
+        memcpy(ext + m * PYWT_BLOCK, input + k * stride, g * sizeof(TYPE));
+    }
+}
+
+/* Decomposition of g lines at once from ext (_sym_rows with pad = F - 1): output o of every line is
+ * sum_j filter[j] x[2 o + 1 - j], as in downsampling_convolution; the inner loop runs over the lines (vectorizes).
+ * Written directly to the strided output, g consecutive values per output position. */
+static inline __attribute__((always_inline))
+void CAT(TYPE, _downcoef_lines_g)(const TYPE * const restrict ext, const size_t n_out, const size_t g,
+                                  const REAL_TYPE * const restrict filter, const size_t F,
+                                  char * const output, const pywt_index_t stride_out){
+    size_t o, j, b;
+    for (o = 0; o < n_out; ++o){
+        const TYPE * const e = ext + (2 * o + 1 + F - 1) * PYWT_BLOCK;    // row of input index 2 o + 1
+        TYPE acc[PYWT_BLOCK];
+        TYPE * const dst = (TYPE *)(output + o * stride_out);
+        for (b = 0; b < g; ++b)
+            acc[b] = 0;
+        for (j = 0; j < F; ++j){
+            const REAL_TYPE f = filter[j];
+            const TYPE * const r = e - j * PYWT_BLOCK;
+            for (b = 0; b < g; ++b)
+                acc[b] += f * r[b];
+        }
+        for (b = 0; b < g; ++b)
+            dst[b] = acc[b];
+    }
+}
+
+/* Full blocks with the constant PYWT_BLOCK: accumulators stay in registers */
+static inline void CAT(TYPE, _downcoef_lines)(const TYPE * const restrict ext, const size_t n_out, const size_t g,
+                                              const REAL_TYPE * const restrict filter, const size_t F,
+                                              char * const output, const pywt_index_t stride_out){
+    if (g == PYWT_BLOCK)
+        CAT(TYPE, _downcoef_lines_g)(ext, n_out, PYWT_BLOCK, filter, F, output, stride_out);
+    else
+        CAT(TYPE, _downcoef_lines_g)(ext, n_out, g, filter, F, output, stride_out);
+}
+
 /* One line of a decomposition */
 static inline void CAT(TYPE, _downcoef_row)(const TYPE * const restrict input_row, const size_t n_in,
                                             const DiscreteWavelet * const restrict wavelet,
@@ -132,7 +183,12 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
     if (make_temp_input && make_temp_output && axis != last
             && input_info.strides[last] == sizeof(TYPE) && output_info.strides[last] == sizeof(TYPE)){
         const size_t n_in = input_info.shape[axis], n_out = output_info.shape[axis], n_last = input_info.shape[last];
-        TYPE * const bin = malloc(PYWT_BLOCK * n_in * sizeof(TYPE));
+        const size_t F = wavelet->dec_len;
+        // multi-line kernel: dwt, symmetric mode, one reflection is enough
+        const int lines = transform == DWT_TRANSFORM && dwt_mode == MODE_SYMMETRIC && n_in >= F;
+        const REAL_TYPE * const filter = coef == COEF_APPROX ? wavelet->CAT(dec_lo_, REAL_TYPE)
+                                                             : wavelet->CAT(dec_hi_, REAL_TYPE);
+        TYPE * const bin = malloc(PYWT_BLOCK * (lines ? n_in + 2 * (F - 1) : n_in) * sizeof(TYPE));
         TYPE * const bout = malloc(PYWT_BLOCK * n_out * sizeof(TYPE));
         if (bin == NULL || bout == NULL){
             free(bin); free(bout);
@@ -144,6 +200,18 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
             if (g > PYWT_BLOCK) g = PYWT_BLOCK;
             if (timing) t0 = pywt_now();
             CAT(TYPE, _line_offsets)(i, &input_info, NULL, &output_info, axis, &input_offset, &unused, &output_offset);
+            if (lines){
+                CAT(TYPE, _sym_rows)((const char *) input + input_offset, input_info.strides[axis], n_in, g, F - 1, bin);
+                if (timing) t1 = pywt_now();
+                CAT(TYPE, _downcoef_lines)(bin, n_out, g, filter, F, (char *) output + output_offset,
+                                           output_info.strides[axis]);
+                if (timing){
+                    pywt_t[T_DEC][T_IN] += t1 - t0;
+                    pywt_t[T_DEC][T_KERNEL] += pywt_now() - t1;
+                }
+                i += g;
+                continue;
+            }
             for (j = 0; j < n_in; ++j){
                 const TYPE * src = (const TYPE *)((const char *) input + input_offset + j * input_info.strides[axis]);
                 for (b = 0; b < g; ++b)
