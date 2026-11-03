@@ -15,12 +15,59 @@
 #else
 
 #include "wt.h"
+#include "timing.h"
 
 #if defined _MSC_VER
 #define restrict __restrict
 #elif defined __GNUC__
 #define restrict __restrict__
 #endif
+
+/* Lines copied together on a strided axis (speed work): neighbours along the contiguous last axis, so every strided
+ * access moves PYWT_BLOCK consecutive values (32 floats = one 128-byte cache line on Apple Silicon). */
+#ifndef PYWT_BLOCK
+#define PYWT_BLOCK 32
+#endif
+
+/* Offsets (bytes) of line i: all indices except the one along axis, last axis fastest */
+static inline void CAT(TYPE, _line_offsets)(size_t i, const ArrayInfo * const a, const ArrayInfo * const b,
+                                            const ArrayInfo * const c, const size_t axis,
+                                            pywt_index_t * oa, pywt_index_t * ob, pywt_index_t * oc){
+    size_t j;
+    *oa = *ob = *oc = 0;
+    for (j = 0; j < c->ndim; ++j){
+        size_t j_rev = c->ndim - 1 - j;
+        if (j_rev != axis){
+            size_t axis_idx = i % c->shape[j_rev];
+            i /= c->shape[j_rev];
+            if (a) *oa += axis_idx * a->strides[j_rev];
+            if (b) *ob += axis_idx * b->strides[j_rev];
+            *oc += axis_idx * c->strides[j_rev];
+        }
+    }
+}
+
+/* One line of a decomposition */
+static inline void CAT(TYPE, _downcoef_row)(const TYPE * const restrict input_row, const size_t n_in,
+                                            const DiscreteWavelet * const restrict wavelet,
+                                            TYPE * const restrict output_row, const size_t n_out,
+                                            const Coefficient coef, const MODE dwt_mode,
+                                            const size_t swt_level, const DiscreteTransformType transform){
+    switch (transform) {
+        case DWT_TRANSFORM:
+            if (coef == COEF_APPROX)
+                CAT(TYPE, _dec_a)(input_row, n_in, wavelet, output_row, n_out, dwt_mode);
+            else
+                CAT(TYPE, _dec_d)(input_row, n_in, wavelet, output_row, n_out, dwt_mode);
+            break;
+        case SWT_TRANSFORM:
+            if (coef == COEF_APPROX)
+                CAT(TYPE, _swt_a)(input_row, n_in, wavelet, output_row, n_out, swt_level);
+            else
+                CAT(TYPE, _swt_d)(input_row, n_in, wavelet, output_row, n_out, swt_level);
+            break;
+    }
+}
 
 /* Decomposition of input with lowpass filter */
 
@@ -76,25 +123,62 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
             num_loops *= output_info.shape[i];
     }
 
+    const int timing = pywt_timing_on();
+    double t0 = 0, t1 = 0, t2 = 0;
+    pywt_calls[T_DEC] += timing;
+
+    // Blocked path: strided axis, last axis contiguous in input and output
+    const size_t last = input_info.ndim - 1;
+    if (make_temp_input && make_temp_output && axis != last
+            && input_info.strides[last] == sizeof(TYPE) && output_info.strides[last] == sizeof(TYPE)){
+        const size_t n_in = input_info.shape[axis], n_out = output_info.shape[axis], n_last = input_info.shape[last];
+        TYPE * const bin = malloc(PYWT_BLOCK * n_in * sizeof(TYPE));
+        TYPE * const bout = malloc(PYWT_BLOCK * n_out * sizeof(TYPE));
+        if (bin == NULL || bout == NULL){
+            free(bin); free(bout);
+            goto cleanup;
+        }
+        for (i = 0; i < num_loops; ){
+            size_t j, b, g = n_last - i % n_last;          // lines i .. i + g - 1: neighbours along the last axis
+            pywt_index_t input_offset, output_offset, unused;
+            if (g > PYWT_BLOCK) g = PYWT_BLOCK;
+            if (timing) t0 = pywt_now();
+            CAT(TYPE, _line_offsets)(i, &input_info, NULL, &output_info, axis, &input_offset, &unused, &output_offset);
+            for (j = 0; j < n_in; ++j){
+                const TYPE * src = (const TYPE *)((const char *) input + input_offset + j * input_info.strides[axis]);
+                for (b = 0; b < g; ++b)
+                    bin[b * n_in + j] = src[b];
+            }
+            if (timing) t1 = pywt_now();
+            for (b = 0; b < g; ++b)
+                CAT(TYPE, _downcoef_row)(bin + b * n_in, n_in, wavelet, bout + b * n_out, n_out,
+                                         coef, dwt_mode, swt_level, transform);
+            if (timing) t2 = pywt_now();
+            for (j = 0; j < n_out; ++j){
+                TYPE * dst = (TYPE *)((char *) output + output_offset + j * output_info.strides[axis]);
+                for (b = 0; b < g; ++b)
+                    dst[b] = bout[b * n_out + j];
+            }
+            if (timing){
+                pywt_t[T_DEC][T_IN] += t1 - t0;
+                pywt_t[T_DEC][T_KERNEL] += t2 - t1;
+                pywt_t[T_DEC][T_OUT] += pywt_now() - t2;
+            }
+            i += g;
+        }
+        free(bin); free(bout);
+        free(temp_input); free(temp_output);
+        return 0;
+    }
+
     for (i = 0; i < num_loops; ++i){
-        pywt_index_t j, axis_idx, input_offset = 0, output_offset = 0;
+        pywt_index_t j, input_offset, output_offset, unused;
         const TYPE * input_row;
         TYPE * output_row;
+        if (timing) t0 = pywt_now();
 
         // Calculate offset into linear buffer
-        {
-            size_t reduced_idx = i;
-            for (j = 0; j < output_info.ndim; ++j){
-                size_t j_rev = output_info.ndim - 1 - j;
-                if (j_rev != axis){
-                    axis_idx = reduced_idx % output_info.shape[j_rev];
-                    reduced_idx /= output_info.shape[j_rev];
-
-                    input_offset += (axis_idx * input_info.strides[j_rev]);
-                    output_offset += (axis_idx * output_info.strides[j_rev]);
-                }
-            }
-        }
+        CAT(TYPE, _line_offsets)(i, &input_info, NULL, &output_info, axis, &input_offset, &unused, &output_offset);
 
         // Copy to temporary input if necessary
         if (make_temp_input)
@@ -109,44 +193,10 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
         output_row = make_temp_output ? temp_output
             : (TYPE *)((char *) output + output_offset);
 
-
-        switch (transform) {
-            case DWT_TRANSFORM:
-                // Apply along axis
-                switch (coef){
-                case COEF_APPROX:
-                    CAT(TYPE, _dec_a)(input_row, input_info.shape[axis],
-                                      wavelet,
-                                      output_row, output_info.shape[axis],
-                                      dwt_mode);
-                    break;
-                case COEF_DETAIL:
-                    CAT(TYPE, _dec_d)(input_row, input_info.shape[axis],
-                                      wavelet,
-                                      output_row, output_info.shape[axis],
-                                      dwt_mode);
-                    break;
-                }
-                break;
-
-            case SWT_TRANSFORM:
-                // Apply along axis
-                switch (coef){
-                case COEF_APPROX:
-                    CAT(TYPE, _swt_a)(input_row, input_info.shape[axis],
-                                      wavelet,
-                                      output_row, output_info.shape[axis],
-                                      swt_level);
-                    break;
-                case COEF_DETAIL:
-                    CAT(TYPE, _swt_d)(input_row, input_info.shape[axis],
-                                      wavelet,
-                                      output_row, output_info.shape[axis],
-                                      swt_level);
-                    break;
-                }
-                break;
-        }
+        if (timing) t1 = pywt_now();
+        CAT(TYPE, _downcoef_row)(input_row, input_info.shape[axis], wavelet, output_row, output_info.shape[axis],
+                                 coef, dwt_mode, swt_level, transform);
+        if (timing) t2 = pywt_now();
 
         // Copy from temporary output if necessary
         if (make_temp_output)
@@ -154,6 +204,11 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
                 // Offsets are byte offsets, to need to cast to char and back
                 *(TYPE *)((char *) output + output_offset
                           + j * output_info.strides[axis]) = output_row[j];
+        if (timing){
+            pywt_t[T_DEC][T_IN] += t1 - t0;
+            pywt_t[T_DEC][T_KERNEL] += t2 - t1;
+            pywt_t[T_DEC][T_OUT] += pywt_now() - t2;
+        }
     }
 
     free(temp_input);
@@ -166,6 +221,19 @@ int CAT(TYPE, _downcoef_axis)(const TYPE * const restrict input, const ArrayInfo
     return 6;
 }
 
+
+/* One line of a reconstruction: output = rec_lo * a + rec_hi * d (upsampled); a_row or d_row may be NULL */
+static inline void CAT(TYPE, _idwt_row)(const TYPE * const restrict a_row, const TYPE * const restrict d_row,
+                                        const size_t n, const DiscreteWavelet * const restrict wavelet,
+                                        TYPE * const restrict output_row, const size_t n_out, const MODE mode){
+    memset(output_row, 0, n_out * sizeof(TYPE));    // upsampling_convolution adds to the output
+    if (a_row)
+        CAT(TYPE, _upsampling_convolution_valid_sf)(a_row, n, wavelet->CAT(rec_lo_, REAL_TYPE), wavelet->rec_len,
+                                                     output_row, n_out, mode);
+    if (d_row)
+        CAT(TYPE, _upsampling_convolution_valid_sf)(d_row, n, wavelet->CAT(rec_hi_, REAL_TYPE), wavelet->rec_len,
+                                                     output_row, n_out, mode);
+}
 
 int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo * const a_info,
                           const TYPE * const restrict coefs_d, const ArrayInfo * const d_info,
@@ -230,9 +298,69 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
             num_loops *= output_info.shape[i];
     }
 
+    const int timing = pywt_timing_on();
+    double t0 = 0, t1 = 0, t2 = 0;
+    pywt_calls[T_REC] += timing;
+
+    // Blocked path: strided axis, last axis contiguous in all present inputs and the output
+    const size_t last = output_info.ndim - 1;
+    if (make_temp_output && axis != last && output_info.strides[last] == sizeof(TYPE)
+            && (!have_a || (make_temp_coefs_a && a_info->strides[last] == sizeof(TYPE)))
+            && (!have_d || (make_temp_coefs_d && d_info->strides[last] == sizeof(TYPE)))){
+        const size_t n = have_a ? a_info->shape[axis] : d_info->shape[axis];
+        const size_t n_out = output_info.shape[axis], n_last = output_info.shape[last];
+        TYPE * const ba = have_a ? malloc(PYWT_BLOCK * n * sizeof(TYPE)) : NULL;
+        TYPE * const bd = have_d ? malloc(PYWT_BLOCK * n * sizeof(TYPE)) : NULL;
+        TYPE * const bout = malloc(PYWT_BLOCK * n_out * sizeof(TYPE));
+        if ((have_a && ba == NULL) || (have_d && bd == NULL) || bout == NULL){
+            free(ba); free(bd); free(bout);
+            goto cleanup;
+        }
+        for (i = 0; i < num_loops; ){
+            size_t j, b, g = n_last - i % n_last;          // lines i .. i + g - 1: neighbours along the last axis
+            pywt_index_t a_offset, d_offset, output_offset;
+            if (g > PYWT_BLOCK) g = PYWT_BLOCK;
+            if (timing) t0 = pywt_now();
+            CAT(TYPE, _line_offsets)(i, have_a ? a_info : NULL, have_d ? d_info : NULL, &output_info, axis,
+                                     &a_offset, &d_offset, &output_offset);
+            for (j = 0; j < n; ++j){
+                if (have_a){
+                    const TYPE * src = (const TYPE *)((const char *) coefs_a + a_offset + j * a_info->strides[axis]);
+                    for (b = 0; b < g; ++b)
+                        ba[b * n + j] = src[b];
+                }
+                if (have_d){
+                    const TYPE * src = (const TYPE *)((const char *) coefs_d + d_offset + j * d_info->strides[axis]);
+                    for (b = 0; b < g; ++b)
+                        bd[b * n + j] = src[b];
+                }
+            }
+            if (timing) t1 = pywt_now();
+            for (b = 0; b < g; ++b)
+                CAT(TYPE, _idwt_row)(have_a ? ba + b * n : NULL, have_d ? bd + b * n : NULL, n, wavelet,
+                                     bout + b * n_out, n_out, mode);
+            if (timing) t2 = pywt_now();
+            for (j = 0; j < n_out; ++j){
+                TYPE * dst = (TYPE *)((char *) output + output_offset + j * output_info.strides[axis]);
+                for (b = 0; b < g; ++b)
+                    dst[b] = bout[b * n_out + j];
+            }
+            if (timing){
+                pywt_t[T_REC][T_IN] += t1 - t0;
+                pywt_t[T_REC][T_KERNEL] += t2 - t1;
+                pywt_t[T_REC][T_OUT] += pywt_now() - t2;
+            }
+            i += g;
+        }
+        free(ba); free(bd); free(bout);
+        free(temp_coefs_a); free(temp_coefs_d); free(temp_output);
+        return 0;
+    }
+
     for (i = 0; i < num_loops; ++i){
         pywt_index_t j, axis_idx, a_offset = 0, d_offset = 0, output_offset = 0;
         TYPE * output_row;
+        if (timing) t0 = pywt_now();
 
         // Calculate offset into linear buffer
         {
@@ -268,6 +396,7 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
         output_row = make_temp_output ? temp_output
             : (TYPE *)((char *) output + output_offset);
 
+        if (timing) t1 = pywt_now();
         // upsampling_convolution adds to input, so zero
         memset(output_row, 0, output_info.shape[axis] * sizeof(TYPE));
 
@@ -291,6 +420,7 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
                  output_row, output_info.shape[axis],
                  mode);
         }
+        if (timing) t2 = pywt_now();
 
         // Copy from temporary output if necessary
         if (make_temp_output)
@@ -298,6 +428,11 @@ int CAT(TYPE, _idwt_axis)(const TYPE * const restrict coefs_a, const ArrayInfo *
                 // Offsets are byte offsets, to need to cast to char and back
                 *(TYPE *)((char *) output + output_offset
                           + j * output_info.strides[axis]) = output_row[j];
+        if (timing){
+            pywt_t[T_REC][T_IN] += t1 - t0;
+            pywt_t[T_REC][T_KERNEL] += t2 - t1;
+            pywt_t[T_REC][T_OUT] += pywt_now() - t2;
+        }
     }
 
     free(temp_coefs_a);
